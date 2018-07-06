@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ispace-charrington/log"
 	"github.com/pkg/errors"
 )
 
@@ -39,6 +40,7 @@ type Pool struct {
 	known   map[IPv4]*Host
 	expire  time.Duration
 	randsrc *rand.Rand
+	log     log.Logger
 }
 
 func (p *Pool) String() string {
@@ -49,7 +51,7 @@ func (p *Pool) String() string {
 }
 
 // NewPool will return a Pool corresponding to an IPv4 CIDR (eg "172.18.0.11/16")
-func NewPool(cidr string) (*Pool, error) {
+func NewPool(log log.Logger, cidr string) (*Pool, error) {
 	a, n, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to parse CIDR notation of %s", cidr)
@@ -67,8 +69,10 @@ func NewPool(cidr string) (*Pool, error) {
 		known:   make(map[IPv4]*Host),
 		expire:  30 * time.Second,
 		randsrc: rand.New(rand.NewSource(time.Now().UnixNano())),
+		log:     log,
 	}
 	copy(p.baseIP[:], n.IP)
+	p.log.Info("New pool created (%s)", n)
 	return p, nil
 }
 
@@ -98,6 +102,7 @@ func (p *Pool) expireReservation(a IPv4) {
 	case *PoolReservation:
 		// still a reservation, time to delete
 		delete(p.known, a)
+		p.log.Info("Reservation for %s expired", a)
 	default:
 		// reservation has been consumed
 	}
@@ -109,17 +114,12 @@ func (p *Pool) randomInRange() (IPv4, error) {
 	bits, _ := p.net.Mask.Size()
 	maxhosts := (0x1 << uint(32-bits))
 
-	// refuse to randomly allocate from a full pool
-	if len(p.known) >= maxhosts {
+	// for now, to prevent runaway in this function, don't allocate more than 75%
+	if float32(len(p.known)) >= float32(maxhosts)*0.75 {
+		p.log.Warning("%s covers %d hosts, %d used, refusing to randomly allocate",
+			p.net, maxhosts, len(p.known))
 		return r, fmt.Errorf(
-			"Pool contains too many known hosts for %v (hosts: %d)",
-			p.net, len(p.known))
-	}
-
-	// for now, to prevent runaway in this function, don't allocate more than 50%
-	if len(p.known) >= maxhosts/2 {
-		return r, fmt.Errorf(
-			"Pool is over half full for %v (hosts: %d)",
+			"Pool is over 75%% full for %s (hosts: %d)",
 			p.net, len(p.known))
 	}
 
@@ -149,10 +149,10 @@ func (p *Pool) Probe() (IPv4, error) {
 	defer p.mu.Unlock()
 	ip, err := p.randomInRange()
 	if err != nil {
-		//return ip, errors.Wrapf(err, "Unable to randomly select an IP for Pool %v", p)
-		return ip, errors.Wrap(err, "Unable to randomly select an IP for Pool")
+		return ip, errors.Wrapf(err, "Unable to randomly select an IP for Pool %s", p.net)
 	}
 	p.known[ip] = &Host{Details: &PoolReservation{}}
 	go p.expireReservation(ip)
+	p.log.Info("Reserving %s in %s", ip, p.net)
 	return ip, nil
 }
